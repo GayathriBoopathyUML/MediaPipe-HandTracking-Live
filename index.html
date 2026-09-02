@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MP Hand Tracking Live</title>
+<style>
+  body {
+    margin: 0;
+    background: #111;
+    color: #eee;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  p.sub { color: #aaa; margin-top: 0; margin-bottom: 16px; }
+  .video-wrap {
+    position: relative;
+    width: 100%;
+    max-width: 720px;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 0 20px rgba(0,0,0,0.5);
+  }
+  video { display: none; }
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .controls {
+    margin-top: 16px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  button {
+    background: #2d7dfa;
+    color: white;
+    border: none;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 1rem;
+    cursor: pointer;
+  }
+  button:hover { background: #1f66d6; }
+  label { font-size: 0.9rem; color: #ccc; }
+  #status { margin-top: 10px; font-size: 0.85rem; color: #888; }
+</style>
+</head>
+<body>
+
+<h1>Hand Tracking + Background Blur</h1>
+<p class="sub">Runs fully in your browser using MediaPipe — no server, no upload.</p>
+
+<div class="video-wrap">
+  <video id="input_video" playsinline></video>
+  <canvas id="output_canvas" width="1280" height="960"></canvas>
+</div>
+
+<div class="controls">
+  <button id="start_btn">Start Camera</button>
+  <label for="blur_range">Blur strength</label>
+  <input type="range" id="blur_range" min="2" max="30" value="12" />
+</div>
+
+<div id="status">Click "Start Camera" and allow webcam access.</div>
+
+<!-- MediaPipe JS libraries (CDN) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js" crossorigin="anonymous"></script>
+
+<script>
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('start_btn');
+const blurRange = document.getElementById('blur_range');
+
+let blurAmount = parseInt(blurRange.value, 10);
+blurRange.addEventListener('input', () => {
+  blurAmount = parseInt(blurRange.value, 10);
+});
+
+let latestHandsResults = null;
+let latestSegResults = null;
+
+// --- Hands setup ---
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+});
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.6,
+  minTrackingConfidence: 0.6,
+});
+hands.onResults((results) => {
+  latestHandsResults = results;
+});
+
+// --- Selfie segmentation setup ---
+const selfieSegmentation = new SelfieSegmentation({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`,
+});
+selfieSegmentation.setOptions({ modelSelection: 1 });
+selfieSegmentation.onResults((results) => {
+  latestSegResults = results;
+  render();
+});
+
+function render() {
+  if (!latestSegResults) return;
+
+  canvasCtx.save();
+  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+  // 1. Draw blurred full frame as background
+  canvasCtx.filter = `blur(${blurAmount}px)`;
+  canvasCtx.drawImage(latestSegResults.image, 0, 0, canvasElement.width, canvasElement.height);
+  canvasCtx.filter = 'none';
+
+  // 2. Draw the sharp person on top, masked by segmentation
+  canvasCtx.save();
+  canvasCtx.globalCompositeOperation = 'source-over';
+  canvasCtx.drawImage(latestSegResults.segmentationMask, 0, 0, canvasElement.width, canvasElement.height);
+  canvasCtx.globalCompositeOperation = 'source-in';
+  canvasCtx.drawImage(latestSegResults.image, 0, 0, canvasElement.width, canvasElement.height);
+  canvasCtx.restore();
+
+  // 3. Draw hand landmarks on top
+  if (latestHandsResults && latestHandsResults.multiHandLandmarks) {
+    for (let i = 0; i < latestHandsResults.multiHandLandmarks.length; i++) {
+      const landmarks = latestHandsResults.multiHandLandmarks[i];
+      drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 3 });
+      drawLandmarks(canvasCtx, landmarks, { color: '#FF0000', lineWidth: 1, radius: 3 });
+
+      const label = latestHandsResults.multiHandedness?.[i]?.label || '';
+      const wrist = landmarks[0];
+      const x = wrist.x * canvasElement.width;
+      const y = wrist.y * canvasElement.height;
+      canvasCtx.fillStyle = '#00FF00';
+      canvasCtx.font = '20px sans-serif';
+      canvasCtx.fillText(label, x - 20, y - 20);
+    }
+  }
+
+  canvasCtx.restore();
+}
+
+async function onFrame() {
+  await selfieSegmentation.send({ image: videoElement });
+  await hands.send({ image: videoElement });
+}
+
+let camera = null;
+
+startBtn.addEventListener('click', async () => {
+  startBtn.disabled = true;
+  statusEl.textContent = 'Requesting camera access...';
+  try {
+    camera = new Camera(videoElement, {
+      onFrame: onFrame,
+      width: 1280,
+      height: 960,
+    });
+    await camera.start();
+    statusEl.textContent = 'Camera running. Both hands tracked, background blurred.';
+  } catch (err) {
+    statusEl.textContent = 'Camera access failed: ' + err.message;
+    startBtn.disabled = false;
+  }
+});
+</script>
+
+</body>
+</html>
