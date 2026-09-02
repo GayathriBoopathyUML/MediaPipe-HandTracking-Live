@@ -18,14 +18,6 @@ python -m http.server 8000
 
 Then visit `http://localhost:8000`.
 
-## Deploy to GitHub Pages
-
-1. Create a new GitHub repo (e.g. `MP-handtracking-live`) and push `index.html` (and this `README.md`) to the `main` branch.
-2. In the repo, go to **Settings -> Pages**.
-3. Under **Source**, select **Deploy from a branch**, branch `main`, folder `/ (root)`, then **Save**.
-4. Wait a minute or two -- GitHub will publish it at:
-   `https://<your-username>.github.io/<repo-name>/`
-
 ## Notes
 
 - Everything (hand landmarks + background blur) runs on-device via WebAssembly -- no video is ever uploaded anywhere.
