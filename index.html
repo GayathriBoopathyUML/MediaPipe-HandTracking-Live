@@ -3,6 +3,717 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hand Control App</title>
+<style>
+  body {
+    margin: 0;
+    background: #111;
+    color: #eee;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  p.sub { color: #aaa; margin-top: 0; margin-bottom: 16px; text-align: center; max-width: 640px; }
+  .video-wrap {
+    position: relative;
+    width: 100%;
+    max-width: 1000px;
+    aspect-ratio: 1200 / 700;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 0 20px rgba(0,0,0,0.5);
+  }
+  video { display: none; }
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .controls { margin-top: 16px; }
+  button {
+    background: #2d7dfa;
+    color: white;
+    border: none;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 1rem;
+    cursor: pointer;
+  }
+  button:hover { background: #1f66d6; }
+  button:disabled { background: #555; cursor: default; }
+  #status { margin-top: 10px; font-size: 0.85rem; color: #888; }
+</style>
+</head>
+<body>
+
+<h1>Hand Control App</h1>
+<p class="sub">
+  5-stage hand-controlled game: circle zoom, arc control, drag &amp; drop,
+  correct drag &amp; drop, and a sliding puzzle — all controlled with your hand via webcam.
+  Runs fully in your browser using MediaPipe.
+</p>
+
+<div class="video-wrap">
+  <video id="input_video" playsinline></video>
+  <canvas id="output_canvas" width="1200" height="700"></canvas>
+</div>
+
+<div class="controls">
+  <button id="start_btn">Start Camera</button>
+</div>
+
+<div id="status">Click "Start Camera" and allow webcam access.</div>
+
+<!-- MediaPipe JS libraries (CDN) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+// ------------------ Common Setup --------------------
+const SCREEN_W = 1200, SCREEN_H = 700;
+const FINGER_TIPS = [4, 8, 12, 16, 20];
+const PINCH_THRESHOLD = 70;
+
+const videoElement = document.getElementById('input_video');
+const outputCanvas = document.getElementById('output_canvas');
+const ctx = outputCanvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('start_btn');
+
+// Offscreen canvas holds the MIRRORED camera frame (matches Python's cv2.flip(frame,1)
+// applied BEFORE mediapipe processing, so handedness labels line up with what the user sees).
+const procCanvas = document.createElement('canvas');
+procCanvas.width = SCREEN_W;
+procCanvas.height = SCREEN_H;
+const procCtx = procCanvas.getContext('2d');
+
+// ------------------ Helpers --------------------
+function distance(p1, p2) {
+  return Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+}
+
+function toPixelLandmarks(landmarks) {
+  // Convert normalized (0..1) landmarks to pixel coords in SCREEN_W x SCREEN_H space.
+  return landmarks.map((lm) => [lm.x * SCREEN_W, lm.y * SCREEN_H]);
+}
+
+function getHandCenter(px) {
+  const xs = FINGER_TIPS.map((i) => px[i][0]);
+  const ys = FINGER_TIPS.map((i) => px[i][1]);
+  const mean = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+  return [mean(xs), mean(ys)];
+}
+
+function calculateRadius(px) {
+  const center = getHandCenter(px);
+  const dists = FINGER_TIPS.map((i) => distance(center, px[i]));
+  return dists.reduce((a, b) => a + b, 0) / dists.length;
+}
+
+function isThumbsUp(px) {
+  const y = (i) => px[i][1];
+  const thumbUp = y(4) < y(3) && y(3) < y(2);
+  const pairs = [[8, 6], [12, 10], [16, 14], [20, 18]];
+  const fingersFolded = pairs.every(([tip, pip]) => y(tip) > y(pip));
+  return thumbUp && fingersFolded;
+}
+
+function projectPointToArc(point, center, radius, startAngle, endAngle) {
+  const dx = point[0] - center[0];
+  const dy = point[1] - center[1];
+  let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+  if (angle < 0) angle += 360;
+  angle = Math.max(Math.min(angle, endAngle), startAngle);
+  const rad = (angle * Math.PI) / 180;
+  return [center[0] + radius * Math.cos(rad), center[1] + radius * Math.sin(rad)];
+}
+
+function drawLandmarksSimple(px) {
+  const CONNECTIONS = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [5,9],[9,10],[10,11],[11,12],
+    [9,13],[13,14],[14,15],[15,16],
+    [13,17],[17,18],[18,19],[19,20],
+    [0,17]
+  ];
+  ctx.strokeStyle = '#00FF00';
+  ctx.lineWidth = 2;
+  for (const [a, b] of CONNECTIONS) {
+    ctx.beginPath();
+    ctx.moveTo(px[a][0], px[a][1]);
+    ctx.lineTo(px[b][0], px[b][1]);
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#FF0000';
+  for (const [x, y] of px) {
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawTitle(text) {
+  ctx.fillStyle = '#00FFFF';
+  ctx.font = 'bold 24px sans-serif';
+  ctx.fillText(text, 10, 30);
+}
+
+// ------------------ Popup (fade in/out message) --------------------
+function drawPopup(title, message, elapsedMs, durationMs) {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+
+  const fadeMs = 500;
+  let alpha;
+  if (elapsedMs < fadeMs) {
+    alpha = elapsedMs / fadeMs;
+  } else if (elapsedMs > durationMs - fadeMs) {
+    alpha = Math.max(0, (durationMs - elapsedMs) / fadeMs);
+  } else {
+    alpha = 1;
+  }
+  const g = Math.floor(255 * alpha);
+  ctx.fillStyle = `rgb(0,${g},0)`;
+
+  ctx.font = 'bold 60px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(title, SCREEN_W / 2, SCREEN_H / 2 - 10);
+
+  if (message) {
+    ctx.font = '24px sans-serif';
+    ctx.fillText(message, SCREEN_W / 2, SCREEN_H / 2 + 40);
+  }
+  ctx.textAlign = 'left';
+}
+
+// ------------------ Stage 1: Circle Zoom --------------------
+const stage1 = {
+  duration: 30000,
+  circleCenter: null,
+  circleRadius: 50,
+  lastHandCenter: null,
+  reset() {
+    this.circleCenter = null;
+    this.circleRadius = 50;
+    this.lastHandCenter = null;
+  },
+  update(results) {
+    let rightPx = null;
+    if (results.multiHandLandmarks && results.multiHandedness) {
+      for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+        const label = results.multiHandedness[i].label;
+        if (label === 'Right') {
+          rightPx = toPixelLandmarks(results.multiHandLandmarks[i]);
+          break;
+        }
+      }
+    }
+    if (rightPx) {
+      drawLandmarksSimple(rightPx);
+      const handCenter = getHandCenter(rightPx);
+      const thumbUp = isThumbsUp(rightPx);
+
+      if (thumbUp) {
+        if (this.lastHandCenter && this.circleCenter) {
+          const dx = handCenter[0] - this.lastHandCenter[0];
+          const dy = handCenter[1] - this.lastHandCenter[1];
+          this.circleCenter = [this.circleCenter[0] + dx, this.circleCenter[1] + dy];
+        }
+      } else {
+        const currentRadius = calculateRadius(rightPx);
+        if (this.circleCenter === null) {
+          this.circleCenter = handCenter;
+        } else if (this.lastHandCenter) {
+          const dx = handCenter[0] - this.lastHandCenter[0];
+          const dy = handCenter[1] - this.lastHandCenter[1];
+          this.circleCenter = [this.circleCenter[0] + dx, this.circleCenter[1] + dy];
+        }
+        this.circleRadius = currentRadius;
+      }
+      this.lastHandCenter = handCenter;
+    }
+
+    if (this.circleCenter) {
+      ctx.strokeStyle = '#00FF00';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(this.circleCenter[0], this.circleCenter[1], this.circleRadius, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    drawTitle('Stage 1: Circle Zoom (use RIGHT hand, thumbs-up to move)');
+  },
+};
+
+// ------------------ Stage 2: Arc Control --------------------
+const stage2 = {
+  duration: 30000,
+  circleCenter: null,
+  circleRadius: 50,
+  arcCenter: [500, 300],
+  arcRadius: 250,
+  arcStart: 150,
+  arcEnd: 360,
+  reset() {
+    this.circleCenter = null;
+    this.circleRadius = 50;
+  },
+  update(results) {
+    let rightPx = null;
+    if (results.multiHandLandmarks && results.multiHandedness) {
+      for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+        const label = results.multiHandedness[i].label;
+        if (label === 'Right') {
+          rightPx = toPixelLandmarks(results.multiHandLandmarks[i]);
+          break;
+        }
+      }
+    }
+    if (rightPx) {
+      drawLandmarksSimple(rightPx);
+      const handCenter = getHandCenter(rightPx);
+      this.circleCenter = projectPointToArc(
+        handCenter, this.arcCenter, this.arcRadius, this.arcStart, this.arcEnd
+      );
+      this.circleRadius = calculateRadius(rightPx);
+    }
+
+    ctx.strokeStyle = '#FF0000';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(
+      this.arcCenter[0], this.arcCenter[1], this.arcRadius,
+      (this.arcStart * Math.PI) / 180, (this.arcEnd * Math.PI) / 180
+    );
+    ctx.stroke();
+
+    if (this.circleCenter) {
+      ctx.strokeStyle = '#00FF00';
+      ctx.beginPath();
+      ctx.arc(this.circleCenter[0], this.circleCenter[1], this.circleRadius, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    drawTitle('Stage 2: Arc Control (use RIGHT hand)');
+  },
+};
+
+// ------------------ Shared grid/ball config for stages 3-5 --------------------
+const GRID_ROWS = 3, GRID_COLS = 3;
+const BOX_W = SCREEN_W / GRID_COLS, BOX_H = SCREEN_H / GRID_ROWS;
+const BALL_RADIUS = 30;
+const BALL_COLORS = [
+  '#FF0000', '#00FF00', '#0000FF',
+  '#00FFFF', '#FFFF00', '#FF00FF',
+  '#FF6464', '#6464FF', '#64FF64',
+];
+
+function drawGrid() {
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  for (let r = 0; r < GRID_ROWS; r++) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      ctx.strokeRect(c * BOX_W, r * BOX_H, BOX_W, BOX_H);
+    }
+  }
+}
+
+function drawBall(pos, colorIdx, number) {
+  ctx.fillStyle = BALL_COLORS[colorIdx];
+  ctx.beginPath();
+  ctx.arc(pos[0], pos[1], BALL_RADIUS, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(String(number), pos[0], pos[1]);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+}
+
+function firstHandPixels(results) {
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+    return toPixelLandmarks(results.multiHandLandmarks[0]);
+  }
+  return null;
+}
+
+function pinchInfo(px) {
+  const thumbTip = px[4];
+  const indexTip = px[8];
+  const d = distance(thumbTip, indexTip);
+  const pinch = d < PINCH_THRESHOLD;
+  ctx.fillStyle = pinch ? '#00FF00' : '#FF0000';
+  ctx.beginPath(); ctx.arc(thumbTip[0], thumbTip[1], 10, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(indexTip[0], indexTip[1], 10, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = pinch ? '#00FF00' : '#FF0000';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(thumbTip[0], thumbTip[1]); ctx.lineTo(indexTip[0], indexTip[1]); ctx.stroke();
+  return { pinch, handCenter: indexTip };
+}
+
+// ------------------ Stage 3: Cube Ball Drop (any cell) --------------------
+const stage3 = {
+  ballPositions: [],
+  picked: [],
+  placed: [],
+  selectedIdx: null,
+  reset() {
+    this.ballPositions = Array.from({ length: 9 }, (_, i) => [
+      SCREEN_W - BALL_RADIUS - 20, 50 + i * (BALL_RADIUS * 2 + 10),
+    ]);
+    this.picked = Array(9).fill(false);
+    this.placed = Array(9).fill(null);
+    this.selectedIdx = null;
+  },
+  update(results) {
+    const px = firstHandPixels(results);
+    let pinch = false, handCenter = null;
+    if (px) {
+      const info = pinchInfo(px);
+      pinch = info.pinch;
+      handCenter = info.handCenter;
+    }
+
+    drawGrid();
+
+    if (pinch) {
+      if (this.selectedIdx === null) {
+        for (let i = 0; i < 9; i++) {
+          if (!this.picked[i] && distance(handCenter, this.ballPositions[i]) < BALL_RADIUS) {
+            this.selectedIdx = i;
+            break;
+          }
+        }
+      } else {
+        this.ballPositions[this.selectedIdx] = handCenter;
+      }
+    } else if (this.selectedIdx !== null && handCenter) {
+      const col = Math.floor(handCenter[0] / BOX_W);
+      const row = Math.floor(handCenter[1] / BOX_H);
+      if (row >= 0 && row < GRID_ROWS && col >= 0 && col < GRID_COLS) {
+        const cx = col * BOX_W + BOX_W / 2;
+        const cy = row * BOX_H + BOX_H / 2;
+        this.placed[this.selectedIdx] = [cx, cy];
+        this.picked[this.selectedIdx] = true;
+      }
+      this.selectedIdx = null;
+    }
+
+    for (let i = 0; i < 9; i++) {
+      const pos = this.picked[i] && this.placed[i] ? this.placed[i] : this.ballPositions[i];
+      drawBall(pos, i, i + 1);
+    }
+
+    drawTitle('Stage 3: Drag & Drop (pinch to grab, any cell)');
+  },
+  isDone() {
+    return this.picked.every((p, i) => p && this.placed[i]);
+  },
+};
+
+// ------------------ Stage 4: Correct Drag & Drop --------------------
+const stage4 = {
+  ballPositions: [],
+  picked: [],
+  placed: [],
+  selectedIdx: null,
+  reset() {
+    this.ballPositions = Array.from({ length: 9 }, (_, i) => [
+      SCREEN_W - BALL_RADIUS - 20, 50 + i * (BALL_RADIUS * 2 + 10),
+    ]);
+    this.picked = Array(9).fill(false);
+    this.placed = Array(9).fill(null);
+    this.selectedIdx = null;
+  },
+  update(results) {
+    const px = firstHandPixels(results);
+    let pinch = false, handCenter = null;
+    if (px) {
+      const info = pinchInfo(px);
+      pinch = info.pinch;
+      handCenter = info.handCenter;
+    }
+
+    drawGrid();
+
+    if (pinch) {
+      if (this.selectedIdx === null) {
+        for (let i = 0; i < 9; i++) {
+          if (!this.picked[i] && distance(handCenter, this.ballPositions[i]) < BALL_RADIUS) {
+            this.selectedIdx = i;
+            break;
+          }
+        }
+      } else {
+        this.ballPositions[this.selectedIdx] = handCenter;
+      }
+    } else if (this.selectedIdx !== null && handCenter) {
+      const col = Math.floor(handCenter[0] / BOX_W);
+      const row = Math.floor(handCenter[1] / BOX_H);
+      if (row >= 0 && row < GRID_ROWS && col >= 0 && col < GRID_COLS) {
+        const gridIndex = row * GRID_COLS + col;
+        if (this.selectedIdx === gridIndex) {
+          const cx = col * BOX_W + BOX_W / 2;
+          const cy = row * BOX_H + BOX_H / 2;
+          this.placed[this.selectedIdx] = [cx, cy];
+          this.picked[this.selectedIdx] = true;
+        } else {
+          this.ballPositions[this.selectedIdx] = [
+            SCREEN_W - BALL_RADIUS - 20, 50 + this.selectedIdx * (BALL_RADIUS * 2 + 10),
+          ];
+          this.picked[this.selectedIdx] = false;
+        }
+      }
+      this.selectedIdx = null;
+    }
+
+    for (let i = 0; i < 9; i++) {
+      const pos = this.picked[i] && this.placed[i] ? this.placed[i] : this.ballPositions[i];
+      drawBall(pos, i, i + 1);
+    }
+
+    drawTitle('Stage 4: Correct Drag & Drop (must match cell number)');
+  },
+  isDone() {
+    return this.picked.every((p, i) => p && this.placed[i]);
+  },
+};
+
+// ------------------ Stage 5: Sliding Puzzle --------------------
+const stage5 = {
+  ballToGrid: [],
+  gridToBall: [],
+  ballPositions: [],
+  selectedIdx: null,
+  gridCenter(index) {
+    const row = Math.floor(index / GRID_COLS);
+    const col = index % GRID_COLS;
+    return [col * BOX_W + BOX_W / 2, row * BOX_H + BOX_H / 2];
+  },
+  gridIndexAt(x, y) {
+    const col = Math.floor(x / BOX_W);
+    const row = Math.floor(y / BOX_H);
+    if (col >= 0 && col < GRID_COLS && row >= 0 && row < GRID_ROWS) {
+      return row * GRID_COLS + col;
+    }
+    return null;
+  },
+  reset() {
+    const indices = [...Array(9).keys()];
+    for (let i = indices.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    this.ballToGrid = Array(9).fill(null);
+    this.gridToBall = Array(9).fill(null);
+    for (let i = 0; i < 9; i++) {
+      this.ballToGrid[i] = indices[i];
+      this.gridToBall[indices[i]] = i;
+    }
+    this.ballPositions = Array.from({ length: 9 }, (_, i) => this.gridCenter(this.ballToGrid[i]));
+    this.selectedIdx = null;
+  },
+  update(results) {
+    const px = firstHandPixels(results);
+    let pinch = false, handCenter = null;
+    if (px) {
+      const info = pinchInfo(px);
+      pinch = info.pinch;
+      handCenter = info.handCenter;
+    }
+
+    for (let i = 0; i < 9; i++) {
+      const [cx, cy] = this.gridCenter(i);
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(cx - BOX_W / 2, cy - BOX_H / 2, BOX_W, BOX_H);
+    }
+
+    if (pinch && handCenter) {
+      if (this.selectedIdx === null) {
+        for (let i = 0; i < 9; i++) {
+          if (distance(this.ballPositions[i], handCenter) < BALL_RADIUS) {
+            this.selectedIdx = i;
+            break;
+          }
+        }
+      } else {
+        this.ballPositions[this.selectedIdx] = handCenter;
+      }
+    } else if (this.selectedIdx !== null && handCenter) {
+      const dropIndex = this.gridIndexAt(handCenter[0], handCenter[1]);
+      const selIdx = this.selectedIdx;
+      if (dropIndex !== null) {
+        const correctNumberForCell = dropIndex + 1;
+        const selectedBallNumber = selIdx + 1;
+        if (selectedBallNumber === correctNumberForCell) {
+          const oldCell = this.ballToGrid[selIdx];
+          const occupyingBall = this.gridToBall[dropIndex];
+          if (oldCell !== null) this.gridToBall[oldCell] = null;
+          if (occupyingBall !== null) {
+            this.ballToGrid[occupyingBall] = oldCell;
+            this.gridToBall[oldCell] = occupyingBall;
+            this.ballPositions[occupyingBall] = this.gridCenter(oldCell);
+          }
+          this.ballToGrid[selIdx] = dropIndex;
+          this.gridToBall[dropIndex] = selIdx;
+          this.ballPositions[selIdx] = this.gridCenter(dropIndex);
+        } else {
+          this.ballPositions[selIdx] = this.gridCenter(this.ballToGrid[selIdx]);
+        }
+      } else {
+        this.ballPositions[selIdx] = this.gridCenter(this.ballToGrid[selIdx]);
+      }
+      this.selectedIdx = null;
+    }
+
+    for (let i = 0; i < 9; i++) {
+      drawBall(this.ballPositions[i], i, i + 1);
+    }
+
+    drawTitle('Stage 5: Puzzle (drag numbers into their matching cell)');
+  },
+  isDone() {
+    return this.ballToGrid.every((cell, i) => cell === i);
+  },
+};
+
+// ------------------ Overall flow / state machine --------------------
+const STEPS = [
+  { type: 'popup', title: 'Stage 1', message: 'Circle Zoom with finger-tips.', duration: 2500 },
+  { type: 'stage', stage: stage1 },
+  { type: 'popup', title: 'Stage 1 Complete', message: 'Hurray! Well done!', duration: 2500 },
+
+  { type: 'popup', title: 'Stage 2', message: 'Move circle on the arc-line with hand.', duration: 2500 },
+  { type: 'stage', stage: stage2 },
+  { type: 'popup', title: 'Stage 2 Complete', message: 'Awesome job!', duration: 2500 },
+
+  { type: 'popup', title: 'Stage 3', message: 'Place numbers in any block.', duration: 2500 },
+  { type: 'stage', stage: stage3 },
+  { type: 'popup', title: 'Stage 3 Complete', message: 'All balls placed!', duration: 2500 },
+
+  { type: 'popup', title: 'Stage 4', message: 'Place numbers in the exact block.', duration: 2500 },
+  { type: 'stage', stage: stage4 },
+  { type: 'popup', title: 'Stage 4 Complete', message: 'Well done! You nailed it!', duration: 2500 },
+
+  { type: 'popup', title: 'Stage 5', message: 'Arrange numbers in the block.', duration: 2500 },
+  { type: 'stage', stage: stage5 },
+  { type: 'popup', title: 'Stage 5 Complete', message: 'All done! Solved puzzle!', duration: 3000 },
+
+  { type: 'popup', title: 'Game Complete', message: 'Refresh the page to play again.', duration: 999999 },
+];
+
+let stepIndex = 0;
+let stepStart = performance.now();
+let stepEntered = false;
+let latestResults = null;
+
+function enterStep() {
+  const step = STEPS[stepIndex];
+  stepStart = performance.now();
+  if (step.type === 'stage' && step.stage.reset) {
+    step.stage.reset();
+  }
+  stepEntered = true;
+}
+
+function advanceStep() {
+  stepIndex = Math.min(stepIndex + 1, STEPS.length - 1);
+  stepEntered = false;
+}
+
+// ------------------ MediaPipe Hands --------------------
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+});
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.7,
+});
+hands.onResults((results) => {
+  latestResults = results;
+});
+
+// ------------------ Main render loop --------------------
+function renderFrame() {
+  // Mirror the raw video into the processing canvas (matches Python's cv2.flip before processing)
+  procCtx.save();
+  procCtx.translate(SCREEN_W, 0);
+  procCtx.scale(-1, 1);
+  procCtx.drawImage(videoElement, 0, 0, SCREEN_W, SCREEN_H);
+  procCtx.restore();
+
+  hands.send({ image: procCanvas });
+
+  if (!stepEntered) enterStep();
+  const step = STEPS[stepIndex];
+  const elapsed = performance.now() - stepStart;
+
+  if (step.type === 'popup') {
+    drawPopup(step.title, step.message, elapsed, step.duration);
+    if (elapsed >= step.duration) advanceStep();
+  } else if (step.type === 'stage') {
+    // Draw the mirrored camera frame as the background
+    ctx.drawImage(procCanvas, 0, 0, SCREEN_W, SCREEN_H);
+    if (latestResults) {
+      step.stage.update(latestResults);
+    } else {
+      drawTitle('Waiting for hand detection...');
+    }
+
+    const isTimedStage = step.stage === stage1 || step.stage === stage2;
+    const done = isTimedStage ? elapsed >= step.stage.duration : step.stage.isDone && step.stage.isDone();
+    if (done) advanceStep();
+  }
+
+  requestAnimationFrame(renderFrame);
+}
+
+// ------------------ Camera bootstrap --------------------
+startBtn.addEventListener('click', async () => {
+  startBtn.disabled = true;
+  statusEl.textContent = 'Requesting camera access...';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720 },
+      audio: false,
+    });
+    videoElement.srcObject = stream;
+    await videoElement.play();
+    statusEl.textContent = 'Running — follow the on-screen stage instructions.';
+    requestAnimationFrame(renderFrame);
+  } catch (err) {
+    statusEl.textContent = 'Camera access failed: ' + err.message;
+    startBtn.disabled = false;
+  }
+});
+</script>
+
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+<!--
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>MP Hand Tracking Live</title>
 <style>
   body {
@@ -71,7 +782,7 @@
 
 <div id="status">Click "Start Camera" and allow webcam access.</div>
 
-<!-- MediaPipe JS libraries (CDN) -->
+<!-- MediaPipe JS libraries (CDN) 
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
@@ -183,3 +894,5 @@ startBtn.addEventListener('click', async () => {
 
 </body>
 </html>
+
+-->
